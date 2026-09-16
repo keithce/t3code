@@ -8,6 +8,7 @@
  * @module ClaudeAdapterLive
  */
 
+import { isDeepStrictEqual } from "node:util";
 import {
   type CanUseTool,
   query,
@@ -191,12 +192,22 @@ const remapClaudeForkTurnBoundaries = (
   if (retainedConversation.length === 0) {
     return retainedBoundaries.every((id) => id === null) ? [...retainedBoundaries] : undefined;
   }
-  const lastRetained = retainedConversation.at(-1);
-  const lastFork = forkConversation.at(-1);
-  if (lastRetained === undefined || lastFork === undefined || lastFork.type !== lastRetained.type) {
+  const offset = forkConversation.length - retainedConversation.length;
+  // Forks preserve message bodies. Matching roles alone can mistake a restored
+  // steering message for a retained turn when compaction changes the chain.
+  if (
+    offset < 0 ||
+    retainedConversation.some((message, index) => {
+      const forkMessage = forkConversation[index + offset];
+      return (
+        forkMessage === undefined ||
+        forkMessage.type !== message.type ||
+        !isDeepStrictEqual(forkMessage.message, message.message)
+      );
+    })
+  ) {
     return undefined;
   }
-  const offset = forkConversation.length - retainedConversation.length;
   const remapped = retainedBoundaries.map((originalId) => {
     if (originalId === null) return null;
     const originalIndex = conversationIndexForUuid(messages, originalId);

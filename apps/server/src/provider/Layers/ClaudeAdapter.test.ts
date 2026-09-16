@@ -7032,6 +7032,92 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  for (const scenario of [
+    "restores conversation messages between retained turns",
+    "changes retained assistant content without changing its role",
+  ] as const) {
+    it.effect(`rejects a Claude fork that ${scenario}`, () => {
+      const turnIds: Array<string> = [];
+      const harness = makeHarness({
+        forkSession: async () => ({ sessionId: CLAUDE_FORK_SESSION_ID }),
+        getSessionMessages: async (sessionId) => {
+          const history = turnIds.flatMap((turnId, index) => [
+            claudeHistoryMessage({
+              type: "user",
+              uuid: turnId,
+              content: `prompt ${index + 1}`,
+            }),
+            claudeHistoryMessage({
+              type: "assistant",
+              uuid: `assistant-${index + 1}`,
+              content: [{ type: "text", text: `reply ${index + 1}` }],
+            }),
+          ]);
+          if (sessionId !== CLAUDE_FORK_SESSION_ID) return history;
+          const forkHistory = history.slice(0, 4).map((message) => ({
+            ...message,
+            uuid: `fork-${message.uuid}`,
+            session_id: sessionId,
+          }));
+          if (scenario === "restores conversation messages between retained turns") {
+            forkHistory.splice(
+              2,
+              0,
+              claudeHistoryMessage({
+                type: "user",
+                uuid: "fork-restored-steer",
+                sessionId,
+                content: "earlier steer omitted by compaction",
+              }),
+              claudeHistoryMessage({
+                type: "assistant",
+                uuid: "fork-restored-reply",
+                sessionId,
+                content: [{ type: "text", text: "earlier steering reply" }],
+              }),
+            );
+          } else {
+            forkHistory[1] = claudeHistoryMessage({
+              type: "assistant",
+              uuid: "fork-assistant-1",
+              sessionId,
+              content: [{ type: "text", text: "different retained reply" }],
+            });
+          }
+          return forkHistory;
+        },
+      });
+      return Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
+        const session = yield* adapter.startSession({
+          threadId: THREAD_ID,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          runtimeMode: "full-access",
+        });
+        for (let index = 0; index < 3; index++) {
+          const turn = yield* sendCompletedClaudeTurn(
+            adapter,
+            harness,
+            session.threadId,
+            `prompt ${index + 1}`,
+          );
+          turnIds.push(turn.turnId);
+        }
+        const cursorBeforeRollback = (yield* adapter.listSessions())[0]?.resumeCursor;
+        const queryCountBeforeRollback = harness.queries.length;
+
+        const error = yield* adapter.rollbackThread(session.threadId, 1).pipe(Effect.flip);
+        assert.match(error.message, /did not preserve the retained turn boundaries/);
+        assert.equal(harness.queries.length, queryCountBeforeRollback);
+        assert.equal(harness.queries.at(-1)?.closeCalls, 0);
+        assert.deepEqual((yield* adapter.listSessions())[0]?.resumeCursor, cursorBeforeRollback);
+      }).pipe(
+        Effect.provideService(Random.Random, makeDeterministicRandomService()),
+        Effect.provide(harness.layer),
+      );
+    });
+  }
+
   it.effect("updates model on sendTurn when model override is provided", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
