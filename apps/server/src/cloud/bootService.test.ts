@@ -92,14 +92,15 @@ const launchdNotLoadedMessage =
   'Could not find service "com.t3tools.t3code.service" in domain for user gui: 501';
 
 const processResult = (input?: {
-  readonly code?: number;
+  readonly code?: number | null;
   readonly stdout?: string;
   readonly stderr?: string;
+  readonly timedOut?: boolean;
 }): ProcessRunner.ProcessRunOutput => ({
   stdout: input?.stdout ?? "",
   stderr: input?.stderr ?? "",
-  code: ChildProcessSpawner.ExitCode(input?.code ?? 0),
-  timedOut: false,
+  code: input?.code === null ? null : ChildProcessSpawner.ExitCode(input?.code ?? 0),
+  timedOut: input?.timedOut ?? false,
   stdoutTruncated: false,
   stderrTruncated: false,
   stdoutInvalidUtf8: false,
@@ -189,6 +190,7 @@ const makeHarness = Effect.fn("test.make_boot_service_harness")(function* (
 
   const commands: string[] = [];
   const timeouts = new Map<string, unknown>();
+  const timeoutBehaviors = new Map<string, ProcessRunner.ProcessRunInput["timeoutBehavior"]>();
   const control: {
     failCommand: string | undefined;
     fixtures: Map<string, (call: number) => ProcessRunner.ProcessRunOutput>;
@@ -216,6 +218,7 @@ const makeHarness = Effect.fn("test.make_boot_service_harness")(function* (
       const command = `${input.command} ${input.args.join(" ")}`;
       commands.push(command);
       timeouts.set(command, input.timeout);
+      timeoutBehaviors.set(command, input.timeoutBehavior);
       const call = (control.callCounts.get(command) ?? 0) + 1;
       control.callCounts.set(command, call);
       const signal = control.signals.get(command);
@@ -310,7 +313,17 @@ const makeHarness = Effect.fn("test.make_boot_service_harness")(function* (
       ),
     );
   const service = yield* makeService();
-  return { service, makeService, fs, statePath, commands, timeouts, control, runtime };
+  return {
+    service,
+    makeService,
+    fs,
+    statePath,
+    commands,
+    timeouts,
+    timeoutBehaviors,
+    control,
+    runtime,
+  };
 });
 
 it.layer(NodeServices.layer)("boot service install", (it) => {
@@ -922,6 +935,32 @@ it.layer(NodeServices.layer)("boot service install", (it) => {
         step: "stopping the installed launch agent",
       });
       expect(commands).not.toContain(`launchctl enable ${launchdServiceTarget}`);
+    }),
+  );
+
+  it.effect.each([
+    {
+      command: `launchctl bootout ${launchdServiceTarget}`,
+      expectedStep: "stopping the installed launch agent",
+    },
+    {
+      command: `launchctl print ${launchdServiceTarget}`,
+      expectedStep: "checking whether the launch agent stopped",
+    },
+  ])("preserves a timed-out result from $command", ({ command, expectedStep }) =>
+    Effect.gen(function* () {
+      const { service, control, timeoutBehaviors } = yield* makeHarness("darwin");
+      yield* service.install();
+      control.fixtures.set(command, () => processResult({ code: null, timedOut: true }));
+
+      const error = yield* service.install().pipe(Effect.flip);
+
+      expect(error).toMatchObject({
+        _tag: "BootServiceCommandError",
+        step: expectedStep,
+        timedOut: true,
+      });
+      expect(timeoutBehaviors.get(command)).toBe("timedOutResult");
     }),
   );
 

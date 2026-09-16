@@ -713,7 +713,12 @@ export const make = Effect.fn("cloud.boot_service.make")(function* (input: {
   ) {
     yield* Effect.gen(function* () {
       const bootoutResult = yield* runner
-        .run({ command: entry.command, args: entry.args, timeout: entry.timeout })
+        .run({
+          command: entry.command,
+          args: entry.args,
+          timeout: entry.timeout,
+          timeoutBehavior: "timedOutResult",
+        })
         .pipe(Effect.mapError((cause) => new BootServiceCommandError({ step: entry.step, cause })));
       const bootoutError =
         bootoutResult.code === 0
@@ -723,6 +728,7 @@ export const make = Effect.fn("cloud.boot_service.make")(function* (input: {
               exitCode: bootoutResult.code === null ? undefined : Number(bootoutResult.code),
               stdoutLength: bootoutResult.stdout.length,
               stderrLength: bootoutResult.stderr.length,
+              timedOut: bootoutResult.timedOut,
             });
       if (
         bootoutError !== undefined &&
@@ -734,7 +740,11 @@ export const make = Effect.fn("cloud.boot_service.make")(function* (input: {
 
       while (true) {
         const printResult = yield* runner
-          .run({ command: "launchctl", args: ["print", entry.verifyAbsent.serviceTarget] })
+          .run({
+            command: "launchctl",
+            args: ["print", entry.verifyAbsent.serviceTarget],
+            timeoutBehavior: "timedOutResult",
+          })
           .pipe(
             Effect.mapError(
               (cause) =>
@@ -752,6 +762,7 @@ export const make = Effect.fn("cloud.boot_service.make")(function* (input: {
             exitCode: printResult.code === null ? undefined : Number(printResult.code),
             stdoutLength: printResult.stdout.length,
             stderrLength: printResult.stderr.length,
+            timedOut: printResult.timedOut,
           });
         }
         yield* Effect.sleep(LAUNCHD_STOP_POLL_INTERVAL);
