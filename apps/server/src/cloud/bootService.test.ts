@@ -6,11 +6,14 @@ import {
   HostProcessUserId,
 } from "@t3tools/shared/hostProcess";
 import * as ConfigProvider from "effect/ConfigProvider";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as TestClock from "effect/testing/TestClock";
 import { HttpClient } from "effect/unstable/http";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 
@@ -84,6 +87,44 @@ const macPlan = {
 const macInstallerPath =
   "/opt/homebrew/bin:/Users/theo/.npm-global/bin:/Users/theo/.nvm/versions/node/v22.16.0/bin:/usr/bin:/bin";
 const macRenderOptions = { homeDir: "/Users/theo", environmentPath: macInstallerPath };
+const launchdServiceTarget = "gui/501/com.t3tools.t3code.service";
+const launchdNotLoadedMessage =
+  'Could not find service "com.t3tools.t3code.service" in domain for user gui: 501';
+
+const processResult = (input?: {
+  readonly code?: number;
+  readonly stdout?: string;
+  readonly stderr?: string;
+}): ProcessRunner.ProcessRunOutput => ({
+  stdout: input?.stdout ?? "",
+  stderr: input?.stderr ?? "",
+  code: ChildProcessSpawner.ExitCode(input?.code ?? 0),
+  timedOut: false,
+  stdoutTruncated: false,
+  stderrTruncated: false,
+  stdoutInvalidUtf8: false,
+  stderrInvalidUtf8: false,
+});
+
+it("recognizes only confirmed launchd not-loaded responses", () => {
+  expect(
+    BootService.isConfirmedLaunchdNotLoaded(
+      processResult({ code: 113, stderr: `Bad request.\n${launchdNotLoadedMessage}\n` }),
+      [launchdNotLoadedMessage],
+    ),
+  ).toBe(true);
+  expect(
+    BootService.isConfirmedLaunchdNotLoaded(
+      processResult({ code: 1, stderr: "Boot-out failed: 1: Operation not permitted" }),
+      [launchdNotLoadedMessage],
+    ),
+  ).toBe(false);
+  expect(
+    BootService.isConfirmedLaunchdBootoutNotLoaded(
+      processResult({ code: 3, stderr: "Boot-out failed: 3: No such process\n" }),
+    ),
+  ).toBe(true);
+});
 
 it("runs the pinned runtime's own executable as the launch agent", () => {
   const plist = BootService.renderBootServicePlist(macPlan, macRenderOptions);
@@ -150,12 +191,18 @@ const makeHarness = Effect.fn("test.make_boot_service_harness")(function* (
   const timeouts = new Map<string, unknown>();
   const control: {
     failCommand: string | undefined;
+    fixtures: Map<string, (call: number) => ProcessRunner.ProcessRunOutput>;
+    callCounts: Map<string, number>;
+    signals: Map<string, Deferred.Deferred<void>>;
     stateAfterStop?: string;
     linger: string;
     enabled: boolean;
     active: boolean;
   } = {
     failCommand: undefined,
+    fixtures: new Map(),
+    callCounts: new Map(),
+    signals: new Map(),
     linger: "yes",
     enabled: true,
     active: true,
@@ -167,6 +214,12 @@ const makeHarness = Effect.fn("test.make_boot_service_harness")(function* (
       const command = `${input.command} ${input.args.join(" ")}`;
       commands.push(command);
       timeouts.set(command, input.timeout);
+      const call = (control.callCounts.get(command) ?? 0) + 1;
+      control.callCounts.set(command, call);
+      const signal = control.signals.get(command);
+      if (signal !== undefined) yield* Deferred.succeed(signal, undefined);
+      const fixture = control.fixtures.get(command);
+      if (fixture !== undefined) return fixture(call);
       const failed = command === control.failCommand;
       if (!failed && command === "loginctl enable-linger --no-ask-password 501")
         control.linger = "yes";
@@ -175,9 +228,15 @@ const makeHarness = Effect.fn("test.make_boot_service_harness")(function* (
       if (
         control.stateAfterStop !== undefined &&
         (command === "systemctl --user stop t3code.service" ||
-          command.startsWith("launchctl bootout --wait "))
+          command === `launchctl bootout ${launchdServiceTarget}`)
       ) {
         yield* fs.writeFileString(statePath, control.stateAfterStop).pipe(Effect.orDie);
+      }
+      if (command === `launchctl print ${launchdServiceTarget}`) {
+        return processResult({
+          code: 113,
+          stderr: `Bad request.\n${launchdNotLoadedMessage}\n`,
+        });
       }
       return {
         stdout:
@@ -451,7 +510,8 @@ it.layer(NodeServices.layer)("boot service install", (it) => {
           platform === "linux"
             ? ["systemctl --user stop t3code.service", "systemctl --user restart t3code.service"]
             : [
-                "launchctl bootout --wait gui/501/com.t3tools.t3code.service",
+                "launchctl bootout gui/501/com.t3tools.t3code.service",
+                "launchctl print gui/501/com.t3tools.t3code.service",
                 `launchctl bootstrap gui/501 ${plan.unitPath}`,
               ],
         );
@@ -714,9 +774,8 @@ it.layer(NodeServices.layer)("boot service install", (it) => {
       expect(yield* service.uninstall).toBe(true);
       expect((yield* service.status).installed).toBe(false);
       expect(commands.some((command) => command.startsWith("systemctl "))).toBe(false);
-      // A bootout can block up to the plist's 90s ExitTimeOut; the runner's
-      // 60s default would cancel it and let bootstrap race a loaded job.
-      expect(timeouts.get("launchctl bootout --wait gui/501/com.t3tools.t3code.service")).toEqual(
+      // The supported bootout form is followed by bounded print verification.
+      expect(timeouts.get("launchctl bootout gui/501/com.t3tools.t3code.service")).toEqual(
         Duration.seconds(120),
       );
     }),
@@ -733,7 +792,8 @@ it.layer(NodeServices.layer)("boot service install", (it) => {
       const error = yield* service.install().pipe(Effect.flip);
       expect(error._tag).toBe("BootServiceCommandError");
       expect(commands.filter((command) => command.startsWith("launchctl "))).toEqual([
-        "launchctl bootout --wait gui/501/com.t3tools.t3code.service",
+        "launchctl bootout gui/501/com.t3tools.t3code.service",
+        "launchctl print gui/501/com.t3tools.t3code.service",
         "launchctl enable gui/501/com.t3tools.t3code.service",
         `launchctl bootstrap gui/501 ${plistPath}`,
         `launchctl bootstrap gui/501 ${plistPath}`,
@@ -792,14 +852,114 @@ it.layer(NodeServices.layer)("boot service install", (it) => {
     }),
   );
 
-  it.effect("ignores a bootout for an agent that is not loaded", () =>
+  it.effect("accepts a bootout only when launchd confirms the agent is already absent", () =>
     Effect.gen(function* () {
-      const { service, control } = yield* makeHarness("darwin");
+      const { service, commands, control } = yield* makeHarness("darwin");
       yield* service.install();
-      control.failCommand = "launchctl bootout --wait gui/501/com.t3tools.t3code.service";
+      commands.length = 0;
+      control.fixtures.set(`launchctl bootout ${launchdServiceTarget}`, () =>
+        processResult({ code: 3, stderr: "Boot-out failed: 3: No such process\n" }),
+      );
 
       yield* service.install();
       expect((yield* service.status).current).toBe(true);
+      expect(commands.filter((command) => command.startsWith("launchctl ")).slice(0, 2)).toEqual([
+        `launchctl bootout ${launchdServiceTarget}`,
+        `launchctl print ${launchdServiceTarget}`,
+      ]);
+    }),
+  );
+
+  it.effect("waits for a draining launch agent before bootstrap", () =>
+    Effect.gen(function* () {
+      const { service, commands, control } = yield* makeHarness("darwin");
+      yield* service.install();
+      commands.length = 0;
+      control.callCounts.clear();
+      const firstPrint = yield* Deferred.make<void>();
+      control.signals.set(`launchctl print ${launchdServiceTarget}`, firstPrint);
+      control.fixtures.set(`launchctl print ${launchdServiceTarget}`, (call) =>
+        call === 1
+          ? processResult()
+          : processResult({
+              code: 113,
+              stderr: `Bad request.\n${launchdNotLoadedMessage}\n`,
+            }),
+      );
+
+      const installFiber = yield* service.install().pipe(Effect.forkChild);
+      yield* Deferred.await(firstPrint);
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust(Duration.millis(100));
+      yield* Fiber.join(installFiber);
+
+      expect(commands.filter((command) => command.startsWith("launchctl ")).slice(0, 4)).toEqual([
+        `launchctl bootout ${launchdServiceTarget}`,
+        `launchctl print ${launchdServiceTarget}`,
+        `launchctl print ${launchdServiceTarget}`,
+        `launchctl enable ${launchdServiceTarget}`,
+      ]);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("fails closed on an unexpected bootout error", () =>
+    Effect.gen(function* () {
+      const { service, commands, control } = yield* makeHarness("darwin");
+      yield* service.install();
+      commands.length = 0;
+      control.fixtures.set(`launchctl bootout ${launchdServiceTarget}`, () =>
+        processResult({ code: 1, stderr: "Boot-out failed: 1: Operation not permitted\n" }),
+      );
+
+      const error = yield* service.install().pipe(Effect.flip);
+
+      expect(error).toMatchObject({
+        _tag: "BootServiceCommandError",
+        step: "stopping the installed launch agent",
+      });
+      expect(commands).not.toContain(`launchctl enable ${launchdServiceTarget}`);
+    }),
+  );
+
+  it.effect("times out instead of bootstrapping while the launch agent remains loaded", () =>
+    Effect.gen(function* () {
+      const { service, commands, control } = yield* makeHarness("darwin");
+      yield* service.install();
+      commands.length = 0;
+      control.callCounts.clear();
+      const firstPrint = yield* Deferred.make<void>();
+      control.signals.set(`launchctl print ${launchdServiceTarget}`, firstPrint);
+      control.fixtures.set(`launchctl print ${launchdServiceTarget}`, () => processResult());
+
+      const installFiber = yield* service.install().pipe(Effect.forkChild);
+      yield* Deferred.await(firstPrint);
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust(Duration.seconds(120));
+      const error = yield* Fiber.join(installFiber).pipe(Effect.flip);
+
+      expect(error).toMatchObject({
+        _tag: "BootServiceCommandError",
+        step: "waiting for the launch agent to stop",
+        timedOut: true,
+      });
+      expect(commands).not.toContain(`launchctl enable ${launchdServiceTarget}`);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("uninstalls when launchd confirms the GUI domain is absent", () =>
+    Effect.gen(function* () {
+      const { service, fs, control } = yield* makeHarness("darwin");
+      const plan = yield* service.install();
+      const missingDomain = "Could not find domain for user gui: 501";
+      control.fixtures.set(`launchctl bootout ${launchdServiceTarget}`, () =>
+        processResult({ code: 125, stderr: missingDomain }),
+      );
+      control.fixtures.set(`launchctl print ${launchdServiceTarget}`, () =>
+        processResult({ code: 125, stderr: missingDomain }),
+      );
+
+      expect(yield* service.uninstall).toBe(true);
+      expect(yield* fs.exists(plan.unitPath)).toBe(false);
     }),
   );
 
@@ -828,7 +988,8 @@ it.layer(NodeServices.layer)("boot service install", (it) => {
         );
         expect(serviceStateHasPendingUpdate(yield* fs.readFileString(statePath))).toBe(true);
         expect(commands.filter((command) => command.startsWith("launchctl "))).toEqual([
-          "launchctl bootout --wait gui/501/com.t3tools.t3code.service",
+          "launchctl bootout gui/501/com.t3tools.t3code.service",
+          "launchctl print gui/501/com.t3tools.t3code.service",
           `launchctl bootstrap gui/501 ${plistPath}`,
         ]);
       }
