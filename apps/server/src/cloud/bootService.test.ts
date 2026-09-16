@@ -194,6 +194,7 @@ const makeHarness = Effect.fn("test.make_boot_service_harness")(function* (
     fixtures: Map<string, (call: number) => ProcessRunner.ProcessRunOutput>;
     callCounts: Map<string, number>;
     signals: Map<string, Deferred.Deferred<void>>;
+    delays: Map<string, Duration.Input>;
     stateAfterStop?: string;
     linger: string;
     enabled: boolean;
@@ -203,6 +204,7 @@ const makeHarness = Effect.fn("test.make_boot_service_harness")(function* (
     fixtures: new Map(),
     callCounts: new Map(),
     signals: new Map(),
+    delays: new Map(),
     linger: "yes",
     enabled: true,
     active: true,
@@ -218,6 +220,8 @@ const makeHarness = Effect.fn("test.make_boot_service_harness")(function* (
       control.callCounts.set(command, call);
       const signal = control.signals.get(command);
       if (signal !== undefined) yield* Deferred.succeed(signal, undefined);
+      const delay = control.delays.get(command);
+      if (delay !== undefined) yield* Effect.sleep(delay);
       const fixture = control.fixtures.get(command);
       if (fixture !== undefined) return fixture(call);
       const failed = command === control.failCommand;
@@ -935,6 +939,36 @@ it.layer(NodeServices.layer)("boot service install", (it) => {
       yield* Deferred.await(firstPrint);
       yield* Effect.yieldNow;
       yield* TestClock.adjust(Duration.seconds(120));
+      const error = yield* Fiber.join(installFiber).pipe(Effect.flip);
+
+      expect(error).toMatchObject({
+        _tag: "BootServiceCommandError",
+        step: "waiting for the launch agent to stop",
+        timedOut: true,
+      });
+      expect(commands).not.toContain(`launchctl enable ${launchdServiceTarget}`);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("shares one stop timeout across bootout and absence verification", () =>
+    Effect.gen(function* () {
+      const { service, commands, control } = yield* makeHarness("darwin");
+      yield* service.install();
+      commands.length = 0;
+      control.callCounts.clear();
+      const bootoutStarted = yield* Deferred.make<void>();
+      const firstPrint = yield* Deferred.make<void>();
+      control.signals.set(`launchctl bootout ${launchdServiceTarget}`, bootoutStarted);
+      control.signals.set(`launchctl print ${launchdServiceTarget}`, firstPrint);
+      control.delays.set(`launchctl bootout ${launchdServiceTarget}`, Duration.seconds(60));
+      control.fixtures.set(`launchctl print ${launchdServiceTarget}`, () => processResult());
+
+      const installFiber = yield* service.install().pipe(Effect.forkChild);
+      yield* Deferred.await(bootoutStarted);
+      yield* TestClock.adjust(Duration.seconds(60));
+      yield* Deferred.await(firstPrint);
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust(Duration.seconds(60));
       const error = yield* Fiber.join(installFiber).pipe(Effect.flip);
 
       expect(error).toMatchObject({

@@ -711,27 +711,27 @@ export const make = Effect.fn("cloud.boot_service.make")(function* (input: {
   const runLaunchdBootout = Effect.fn("cloud.boot_service.run_launchd_bootout")(function* (
     entry: Extract<BootServiceStep, { readonly operation: "launchd-bootout" }>,
   ) {
-    const bootoutResult = yield* runner
-      .run({ command: entry.command, args: entry.args, timeout: entry.timeout })
-      .pipe(Effect.mapError((cause) => new BootServiceCommandError({ step: entry.step, cause })));
-    const bootoutError =
-      bootoutResult.code === 0
-        ? undefined
-        : new BootServiceCommandError({
-            step: entry.step,
-            exitCode: bootoutResult.code === null ? undefined : Number(bootoutResult.code),
-            stdoutLength: bootoutResult.stdout.length,
-            stderrLength: bootoutResult.stderr.length,
-          });
-    if (
-      bootoutError !== undefined &&
-      !isConfirmedLaunchdBootoutNotLoaded(bootoutResult) &&
-      !isConfirmedLaunchdNotLoaded(bootoutResult, entry.verifyAbsent.notLoadedMessages)
-    ) {
-      return yield* bootoutError;
-    }
-
     yield* Effect.gen(function* () {
+      const bootoutResult = yield* runner
+        .run({ command: entry.command, args: entry.args, timeout: entry.timeout })
+        .pipe(Effect.mapError((cause) => new BootServiceCommandError({ step: entry.step, cause })));
+      const bootoutError =
+        bootoutResult.code === 0
+          ? undefined
+          : new BootServiceCommandError({
+              step: entry.step,
+              exitCode: bootoutResult.code === null ? undefined : Number(bootoutResult.code),
+              stdoutLength: bootoutResult.stdout.length,
+              stderrLength: bootoutResult.stderr.length,
+            });
+      if (
+        bootoutError !== undefined &&
+        !isConfirmedLaunchdBootoutNotLoaded(bootoutResult) &&
+        !isConfirmedLaunchdNotLoaded(bootoutResult, entry.verifyAbsent.notLoadedMessages)
+      ) {
+        return yield* bootoutError;
+      }
+
       while (true) {
         const printResult = yield* runner
           .run({ command: "launchctl", args: ["print", entry.verifyAbsent.serviceTarget] })
@@ -758,7 +758,9 @@ export const make = Effect.fn("cloud.boot_service.make")(function* (input: {
       }
     }).pipe(
       Effect.timeoutOrElse({
-        duration: STOP_STEP_TIMEOUT,
+        // One deadline covers both bootout and absence verification. Without
+        // this outer bound, each phase could consume a full stop timeout.
+        duration: entry.timeout ?? STOP_STEP_TIMEOUT,
         orElse: () =>
           new BootServiceCommandError({
             step: "waiting for the launch agent to stop",
